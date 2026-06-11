@@ -41,6 +41,15 @@ export type Workout = {
   completed: number;
   personalBests: number;
   calories?: number;
+  sets?: WorkoutSet[];
+};
+
+export type WorkoutSet = {
+  exerciseId: string;
+  setNumber: number;
+  reps: number;
+  weight: number;
+  completed: boolean;
 };
 
 export type CalorieEntry = {
@@ -63,3 +72,26 @@ export type Profile = {
   equipment: string[];
   injuries: string;
 };
+
+export type FitFlowState = {
+  profile: Profile;
+  routines: Routine[];
+  workouts: Workout[];
+  calories: CalorieEntry[];
+  onboarded: boolean;
+};
+
+export type CloudState = {
+  state: FitFlowState;
+  version: number;
+  updatedAt: string | null;
+};
+
+export type AuthStatus = "loading" | "anonymous" | "authenticated";
+
+export type AuthState =
+  | { status: "loading"; userId: null }
+  | { status: "anonymous"; userId: null }
+  | { status: "authenticated"; userId: string };
+
+export type HydrationStatus = "idle" | "loading" | "ready" | "error";

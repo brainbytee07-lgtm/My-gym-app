@@ -46,8 +46,10 @@ create table public.user_states (
   user_id uuid primary key references auth.users(id) on delete cascade,
   profile jsonb not null default '{}', routines jsonb not null default '[]',
   workouts jsonb not null default '[]', calories jsonb not null default '[]', onboarded boolean default false,
+  state_version bigint not null default 0,
   updated_at timestamptz default now()
 );
+alter table public.user_states add column if not exists state_version bigint not null default 0;
 
 alter table public.profiles enable row level security;
 alter table public.exercises enable row level security;
@@ -68,3 +70,60 @@ create policy "Users own workout sets" on public.workout_sets for all using (exi
 create policy "Users own measurements" on public.body_measurements for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "Users own progress photos" on public.progress_photos for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "Users own synced state" on public.user_states for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- Active prototype persistence contract. Applies a write only when the caller's
+-- expected version still matches, preventing silent last-write-wins data loss.
+create or replace function public.compare_and_swap_user_state(
+  expected_version bigint,
+  next_profile jsonb,
+  next_routines jsonb,
+  next_workouts jsonb,
+  next_calories jsonb,
+  next_onboarded boolean
+)
+returns table(applied boolean, new_state_version bigint)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  caller_id uuid := auth.uid();
+  written_version bigint;
+begin
+  if caller_id is null then
+    raise exception 'Authentication required';
+  end if;
+
+  insert into public.user_states (
+    user_id, profile, routines, workouts, calories, onboarded, state_version, updated_at
+  )
+  select
+    caller_id, next_profile, next_routines, next_workouts, next_calories, next_onboarded,
+    expected_version + 1, now()
+  where expected_version = 0
+  on conflict (user_id) do update set
+    profile = excluded.profile,
+    routines = excluded.routines,
+    workouts = excluded.workouts,
+    calories = excluded.calories,
+    onboarded = excluded.onboarded,
+    state_version = excluded.state_version,
+    updated_at = excluded.updated_at
+  where public.user_states.state_version = expected_version
+  returning public.user_states.state_version into written_version;
+
+  if written_version is not null then
+    return query select true, written_version;
+  else
+    return query
+      select false, coalesce((
+        select user_states.state_version
+        from public.user_states
+        where user_states.user_id = caller_id
+      ), 0);
+  end if;
+end;
+$$;
+
+revoke all on function public.compare_and_swap_user_state(bigint, jsonb, jsonb, jsonb, jsonb, boolean) from public;
+grant execute on function public.compare_and_swap_user_state(bigint, jsonb, jsonb, jsonb, jsonb, boolean) to authenticated;

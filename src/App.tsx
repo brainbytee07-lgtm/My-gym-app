@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 import { NavLink, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import {
   Activity, ArrowLeft, ArrowRight, Award, BarChart3, CalendarDays, Check, ChevronRight,
@@ -6,8 +6,13 @@ import {
   ShieldCheck, Sparkles, Target, TrendingUp, Trophy, UserRound, Weight, X
 } from "lucide-react";
 import { exercises, starterCalories, starterRoutines, starterWorkouts } from "./data";
+import {
+  countPersonalBests, currentStreak, generateRoutine, getTodayRoutine, localDate,
+  routineToWorkoutSets, volumeChangePercent, workoutCompletion, workoutVolume, workoutsInLastDays,
+} from "./fitness";
+import { createCloudStateQueue, loadScopedState, saveScopedState, userStorageScope, type StorageScope } from "./storage";
 import { isSupabaseConfigured, supabase } from "./supabase";
-import type { CalorieEntry, Profile, Routine, RoutineExercise, Workout } from "./types";
+import type { AuthState, CalorieEntry, FitFlowState, Profile, Routine, RoutineExercise, Workout, WorkoutSet } from "./types";
 
 const defaultProfile: Profile = {
   name: "Alex Morgan", age: 28, height: 178, weight: 76.4, targetWeight: 72,
@@ -18,72 +23,121 @@ const defaultProfile: Profile = {
 const readStore = <T,>(key: string, fallback: T): T => {
   try { return JSON.parse(localStorage.getItem(key) || "") as T; } catch { return fallback; }
 };
-const readRoutines = () => {
-  const saved = readStore<Routine[]>("fitflow-routines", starterRoutines);
-  return saved.length && saved.every(r => r.exercises.every(item => exercises.some(ex => ex.id === item.exerciseId))) ? saved : starterRoutines;
+const fallbackState: FitFlowState = {
+  profile: defaultProfile,
+  routines: starterRoutines,
+  workouts: starterWorkouts,
+  calories: starterCalories,
+  onboarded: false,
 };
+const validState = (state: FitFlowState): FitFlowState => ({
+  ...state,
+  routines: state.routines.length && state.routines.every(r => r.exercises.every(item => exercises.some(ex => ex.id === item.exerciseId))) ? state.routines : starterRoutines,
+});
 
 function App() {
-  const [signedIn, setSignedIn] = useState(() => readStore("fitflow-signed-in", false));
-  const [onboarded, setOnboarded] = useState(() => readStore("fitflow-onboarded", false));
-  const [profile, setProfile] = useState<Profile>(() => readStore("fitflow-profile", defaultProfile));
-  const [routines, setRoutines] = useState<Routine[]>(readRoutines);
-  const [workouts, setWorkouts] = useState<Workout[]>(() => readStore("fitflow-workouts", starterWorkouts));
-  const [calories, setCalories] = useState<CalorieEntry[]>(() => readStore("fitflow-calories", starterCalories));
-  const [cloudReady, setCloudReady] = useState(false);
+  const initialDemo = validState(loadScopedState(localStorage, "demo", fallbackState));
+  const [signedIn, setSignedIn] = useState<boolean>(() => !isSupabaseConfigured && readStore("fitflow-demo-signed-in", false));
+  const [auth, setAuth] = useState<AuthState>(isSupabaseConfigured ? { status: "loading", userId: null } : { status: "anonymous", userId: null });
+  const [hydrated, setHydrated] = useState(!isSupabaseConfigured);
+  const [profile, setProfile] = useState<Profile>(initialDemo.profile);
+  const [routines, setRoutines] = useState<Routine[]>(initialDemo.routines);
+  const [workouts, setWorkouts] = useState<Workout[]>(initialDemo.workouts);
+  const [calories, setCalories] = useState<CalorieEntry[]>(initialDemo.calories);
+  const [onboarded, setOnboarded] = useState(initialDemo.onboarded);
+  const [cloudError, setCloudError] = useState("");
+  const cloudQueue = useRef<ReturnType<typeof createCloudStateQueue> | null>(null);
+  const skipNextCloudWrite = useRef(false);
+  const activeUser = useRef<string | null | undefined>(undefined);
+  const state: FitFlowState = { profile, routines, workouts, calories, onboarded };
+  const applyState = (next: FitFlowState) => {
+    const checked = validState(next);
+    setProfile(checked.profile); setRoutines(checked.routines); setWorkouts(checked.workouts);
+    setCalories(checked.calories); setOnboarded(checked.onboarded);
+  };
 
   useEffect(() => {
     if (!supabase) return;
-    supabase.auth.getSession().then(({ data }) => {
-      if (data.session) setSignedIn(true);
-    });
-    const { data } = supabase.auth.onAuthStateChange((_event, session) => setSignedIn(Boolean(session)));
+    const handleSession = (userId: string | null) => {
+      if (activeUser.current === userId) return;
+      activeUser.current = userId;
+      setHydrated(false);
+      setCloudError("");
+      cloudQueue.current = null;
+      applyState({ ...fallbackState, workouts: [], calories: [] });
+      setAuth(userId ? { status: "authenticated", userId } : { status: "anonymous", userId: null });
+      setSignedIn(Boolean(userId));
+      if (!userId) setHydrated(true);
+    };
+    supabase.auth.getSession().then(({ data }) => handleSession(data.session?.user.id ?? null));
+    const { data } = supabase.auth.onAuthStateChange((_event, session) => handleSession(session?.user.id ?? null));
     return () => data.subscription.unsubscribe();
   }, []);
   useEffect(() => {
     const client = supabase;
-    if (!client || !signedIn) return;
+    if (!client || auth.status !== "authenticated") return;
+    let cancelled = false;
     const hydrate = async () => {
-      const { data: { user } } = await client.auth.getUser();
-      if (!user) return;
-      const { data } = await client.from("user_states").select("profile,routines,workouts,calories,onboarded").eq("user_id", user.id).maybeSingle() as { data: { profile?: Profile; routines?: Routine[]; workouts?: Workout[]; calories?: CalorieEntry[]; onboarded?: boolean } | null };
-      if (data) {
-        if (data.profile) setProfile(data.profile as Profile);
-        if (data.routines) setRoutines(data.routines as Routine[]);
-        if (data.workouts) setWorkouts(data.workouts as Workout[]);
-        if (data.calories) setCalories(data.calories as CalorieEntry[]);
-        setOnboarded(Boolean(data.onboarded));
+      const scope = userStorageScope(auth.userId);
+      const local = validState(loadScopedState(localStorage, scope, { ...fallbackState, workouts: [], calories: [] }));
+      const { data, error } = await client.from("user_states").select("profile,routines,workouts,calories,onboarded,state_version,updated_at").eq("user_id", auth.userId).maybeSingle() as { data: (FitFlowState & { state_version: number; updated_at: string | null }) | null; error: unknown };
+      if (cancelled) return;
+      if (error) {
+        console.error("FitFlow cloud hydration failed", error);
+        applyState(local);
+        setCloudError("Cloud sync is unavailable. Using this account's saved device data.");
+        setHydrated(true);
+        return;
       }
-      setCloudReady(true);
+      const next = data ? validState(data) : local;
+      applyState(next);
+      saveScopedState(localStorage, scope, next);
+      cloudQueue.current = createCloudStateQueue(data?.state_version ?? 0, async (nextState, expectedVersion) => {
+        const { data: result, error: writeError } = await client.rpc("compare_and_swap_user_state", {
+          expected_version: expectedVersion,
+          next_profile: nextState.profile,
+          next_routines: nextState.routines,
+          next_workouts: nextState.workouts,
+          next_calories: nextState.calories,
+          next_onboarded: nextState.onboarded,
+        }) as { data: { applied: boolean; new_state_version: number }[] | null; error: unknown };
+        if (writeError) throw writeError;
+        const row = result?.[0];
+        return row?.applied ? { status: "saved", version: row.new_state_version } : { status: "conflict", version: row?.new_state_version ?? expectedVersion };
+      });
+      skipNextCloudWrite.current = true;
+      setHydrated(true);
     };
     hydrate();
-  }, [signedIn]);
+    return () => { cancelled = true; };
+  }, [auth]);
   useEffect(() => {
-    const client = supabase;
-    if (!client || !signedIn || !cloudReady) return;
-    const sync = async () => {
-      const { data: { user } } = await client.auth.getUser();
-      if (!user) return;
-      await client.from("user_states").upsert({
-        user_id: user.id, profile, routines, workouts, calories, onboarded, updated_at: new Date().toISOString(),
-      });
-    };
-    const timer = window.setTimeout(sync, 450);
+    if (!signedIn || !hydrated) return;
+    const scope: StorageScope = auth.status === "authenticated" ? userStorageScope(auth.userId) : "demo";
+    saveScopedState(localStorage, scope, state);
+    if (auth.status !== "authenticated" || !cloudQueue.current) return;
+    if (skipNextCloudWrite.current) { skipNextCloudWrite.current = false; return; }
+    const timer = window.setTimeout(async () => {
+      try {
+        const result = await cloudQueue.current?.enqueue(state);
+        setCloudError(result?.status === "conflict" ? "A newer cloud version exists. Reload FitFlow before making more changes." : "");
+      } catch (error) {
+        console.error("FitFlow cloud sync failed", error);
+        setCloudError("Cloud sync is unavailable. Your latest changes remain on this device.");
+      }
+    }, 450);
     return () => window.clearTimeout(timer);
-  }, [profile, routines, workouts, calories, onboarded, signedIn, cloudReady]);
-  useEffect(() => localStorage.setItem("fitflow-signed-in", JSON.stringify(signedIn)), [signedIn]);
-  useEffect(() => localStorage.setItem("fitflow-onboarded", JSON.stringify(onboarded)), [onboarded]);
-  useEffect(() => localStorage.setItem("fitflow-profile", JSON.stringify(profile)), [profile]);
-  useEffect(() => localStorage.setItem("fitflow-routines", JSON.stringify(routines)), [routines]);
-  useEffect(() => localStorage.setItem("fitflow-workouts", JSON.stringify(workouts)), [workouts]);
-  useEffect(() => localStorage.setItem("fitflow-calories", JSON.stringify(calories)), [calories]);
+  }, [profile, routines, workouts, calories, onboarded, signedIn, hydrated, auth]);
+  useEffect(() => { if (!isSupabaseConfigured) localStorage.setItem("fitflow-demo-signed-in", JSON.stringify(signedIn)); }, [signedIn]);
 
   const app = { profile, setProfile, routines, setRoutines, workouts, setWorkouts, calories, setCalories };
+  if (auth.status === "loading" || (signedIn && !hydrated)) return <div className="app-loading"><Dumbbell size={32} /><strong>Loading your FitFlow...</strong></div>;
   if (!signedIn) return <Login onSignIn={() => setSignedIn(true)} />;
   if (!onboarded) return <Onboarding profile={profile} onComplete={(value) => { setProfile(value); setOnboarded(true); }} />;
 
   return (
     <div className="app-shell">
+      {cloudError && <div className="cloud-error">{cloudError}</div>}
       <Routes>
         <Route path="/" element={<Navigate to="/home" replace />} />
         <Route path="/home" element={<Page><HomePage {...app} /></Page>} />
@@ -94,7 +148,7 @@ function App() {
         <Route path="/workout/:id" element={<ActiveWorkout {...app} />} />
         <Route path="/progress" element={<Page><ProgressPage {...app} /></Page>} />
         <Route path="/calories" element={<Page><CaloriesPage {...app} /></Page>} />
-        <Route path="/profile" element={<Page><ProfilePage {...app} onLogout={async () => { if (supabase) await supabase.auth.signOut(); setSignedIn(false); setOnboarded(false); }} /></Page>} />
+        <Route path="/profile" element={<Page><ProfilePage {...app} onLogout={async () => { setHydrated(false); if (supabase) await supabase.auth.signOut(); else { setSignedIn(false); setOnboarded(false); setHydrated(true); } }} /></Page>} />
         <Route path="*" element={<Navigate to="/home" replace />} />
       </Routes>
     </div>
@@ -178,22 +232,32 @@ type AppProps = {
 function HomePage({ profile, routines, workouts, calories }: AppProps) {
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
-  const today = routines[0];
+  const today = getTodayRoutine(routines);
+  const todayKey = localDate();
+  const todayCalories = calories.filter(entry => entry.date === todayKey);
+  const weekWorkouts = workoutsInLastDays(workouts, 7);
+  const streak = currentStreak(workouts);
+  const volumeChange = volumeChangePercent(workouts);
+  const weekDates = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date();
+    date.setDate(date.getDate() - date.getDay() + 1 + index);
+    return { label: date.toLocaleDateString("en-US", { weekday: "narrow" }), key: localDate(date) };
+  });
   return <>
     <AppHeader profile={profile} />
-    <div className="quick-search"><Search size={18} /><input value={query} onChange={e => setQuery(e.target.value)} onKeyDown={e => e.key === "Enter" && navigate(`/exercises?q=${query}`)} placeholder="Search exercises, muscles, equipment" /></div>
+    <label className="quick-search"><Search size={18} /><span className="sr-only">Search exercises</span><input value={query} onChange={e => setQuery(e.target.value)} onKeyDown={e => e.key === "Enter" && navigate(`/exercises?q=${query}`)} placeholder="Search exercises, muscles, equipment" /></label>
     <section className="hero-card">
       <div><span className="pill">Today’s flow</span><h1>{today.name}</h1><p>{today.focus} · {today.exercises.length} exercises</p><button onClick={() => navigate(`/workout/${today.id}`)}>Start workout <Play size={15} fill="currentColor" /></button></div>
       <div className="hero-art"><span /><Dumbbell size={67} /></div>
     </section>
     <SectionHead title="This week" action="View progress" onClick={() => navigate("/progress")} />
     <div className="stat-grid">
-      <StatCard icon={<Flame />} value="5 days" label="Current streak" tone="orange" />
-      <StatCard icon={<Target />} value={`${workouts.length}/4`} label="Workouts done" tone="blue" />
-      <StatCard icon={<TrendingUp />} value="+12%" label="Volume gained" tone="green" />
+      <StatCard icon={<Flame />} value={`${streak} days`} label="Current streak" tone="orange" />
+      <StatCard icon={<Target />} value={`${weekWorkouts.length}/${profile.frequency}`} label="Workouts done" tone="blue" />
+      <StatCard icon={<TrendingUp />} value={`${volumeChange > 0 ? "+" : ""}${volumeChange}%`} label="30-day volume" tone="green" />
     </div>
-    <button className="calorie-summary" onClick={() => navigate("/calories")}><span><Flame size={19}/></span><div><small>Calories today</small><strong>{calories.filter(x=>x.type==="food").reduce((s,x)=>s+x.calories,0)} eaten · {calories.filter(x=>x.type==="exercise").reduce((s,x)=>s+x.calories,0)} burned</strong></div><ChevronRight size={17}/></button>
-    <div className="week-card"><div className="week-score"><strong>75%</strong><span>weekly goal</span></div><div className="days">{["M","T","W","T","F","S","S"].map((d,i) => <div key={i} className={i < 3 ? "done" : i === 4 ? "next" : ""}><i>{i < 3 && <Check size={12} />}</i><span>{d}</span></div>)}</div></div>
+    <button className="calorie-summary" onClick={() => navigate("/calories")}><span><Flame size={19}/></span><div><small>Calories today</small><strong>{todayCalories.filter(x=>x.type==="food").reduce((s,x)=>s+x.calories,0)} eaten · {todayCalories.filter(x=>x.type==="exercise").reduce((s,x)=>s+x.calories,0)} burned</strong></div><ChevronRight size={17}/></button>
+    <div className="week-card"><div className="week-score"><strong>{Math.min(100, Math.round((weekWorkouts.length / profile.frequency) * 100))}%</strong><span>weekly goal</span></div><div className="days">{weekDates.map(day => { const done = workouts.some(workout => workout.date === day.key); return <div key={day.key} className={done ? "done" : ""}><i>{done && <Check size={12} />}</i><span>{day.label}</span></div> })}</div></div>
     <SectionHead title="Your plan" action="See all" onClick={() => navigate("/routines")} />
     <div className="routine-scroll">{routines.map(r => <RoutineCard key={r.id} routine={r} onClick={() => navigate(`/routines/${r.id}`)} />)}</div>
   </>;
@@ -210,7 +274,7 @@ function ExercisesPage() {
   return <>
     <AppHeader title="Explore exercises" />
     <p className="page-intro">Choose a muscle, tool, or machine. Then find your move.</p>
-    <div className="quick-search large"><Search size={18} /><input autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder="Search by exercise, muscle or gear" />{query && <button onClick={() => setQuery("")}><X size={16} /></button>}</div>
+    <label className="quick-search large"><Search size={18} /><span className="sr-only">Search by exercise, muscle, or equipment</span><input autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder="Search by exercise, muscle or gear" />{query && <button type="button" aria-label="Clear exercise search" onClick={() => setQuery("")}><X size={16} /></button>}</label>
     <button className="cardio-banner" onClick={() => { setMuscle("Cardio"); setQuery(""); setEquipment("All"); }}><span><Activity size={22}/></span><div><strong>Cardio training</strong><small>Treadmill, bike, rowing, and more</small></div><ChevronRight size={18}/></button>
     <SectionHead title="Browse by equipment" action={equipment === "All" ? "All equipment" : equipment} />
     <div className="equipment-picker">{equipmentOptions.map(item => <button key={item} onClick={() => setEquipment(item)} className={equipment === item ? "active" : ""}><EquipmentImage equipment={item} /><span>{item === "All" ? "Everything" : item}</span><small>{item === "All" ? exercises.length : exercises.filter(ex => ex.equipment === item).length} moves</small></button>)}</div>
@@ -228,7 +292,7 @@ function ExerciseDetail({ routines, setRoutines }: { routines: Routine[]; setRou
   if (!exercise) return <Navigate to="/exercises" replace />;
   const add = () => { const first = routines[0]; setRoutines([{ ...first, exercises: [...first.exercises, { exerciseId: exercise.id, sets: 3, reps: 10, rest: 60, weight: 0 }] }, ...routines.slice(1)]); setAdded(true); };
   return <div className="detail-page">
-    <button className="back-button" onClick={() => navigate(-1)}><ArrowLeft size={19} /></button>
+    <button aria-label="Back to exercises" className="back-button" onClick={() => navigate("/exercises")}><ArrowLeft size={19} /></button>
     <div className="detail-hero" style={{ background: exercise.color }}><ExerciseArt exercise={exercise} large /><span className="detail-badge">{exercise.difficulty}</span></div>
     <div className="detail-body"><span className="eyebrow">{exercise.muscle} · {exercise.type}</span><h1>{exercise.name}</h1><div className="detail-meta"><div><Dumbbell /><span>Equipment<strong>{exercise.equipment}</strong></span></div><div><Target /><span>Also works<strong>{exercise.secondary.join(", ") || "Isolation"}</strong></span></div></div>
     <h3>How to do it</h3><ol className="steps">{exercise.instructions.map((x,i) => <li key={x}><b>{i + 1}</b><span>{x}</span></li>)}</ol>
@@ -239,11 +303,15 @@ function ExerciseDetail({ routines, setRoutines }: { routines: Routine[]; setRou
 
 function RoutinesPage({ profile, routines, setRoutines, workouts }: AppProps) {
   const navigate = useNavigate(); const [generator, setGenerator] = useState(false);
-  const today = routines[0];
+  const today = getTodayRoutine(routines);
+  const weekDates = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date();
+    date.setDate(date.getDate() - date.getDay() + 1 + index);
+    return { label: date.toLocaleDateString("en-US", { weekday: "narrow" }), number: date.getDate(), key: localDate(date) };
+  });
   const generate = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    const pool = exercises.filter(x => profile.equipment.includes(x.equipment) || x.equipment === "Bodyweight");
-    const generated: Routine = { id: `generated-${Date.now()}`, name: `${profile.goal} Flow`, day: "Saturday", focus: profile.goal, duration: 50, color: "#e3c7ff", exercises: pool.slice(0, 5).map(x => ({ exerciseId: x.id, sets: profile.experience === "Beginner" ? 3 : 4, reps: profile.goal === "Get stronger" ? 6 : 10, rest: 75, weight: 0 })) };
+    const generated = generateRoutine(profile, exercises);
     setRoutines([...routines, generated]); setGenerator(false); navigate(`/routines/${generated.id}`);
   };
   return <>
@@ -256,8 +324,8 @@ function RoutinesPage({ profile, routines, setRoutines, workouts }: AppProps) {
       <button onClick={() => navigate("/exercises")}><span className="train-action-icon lavender"><Search size={20}/></span><strong>Find exercises</strong><small>By muscle or equipment</small><ChevronRight size={16}/></button>
       <button onClick={() => setGenerator(true)}><span className="train-action-icon green"><Sparkles size={20}/></span><strong>Build a routine</strong><small>Matched to your goal</small><ChevronRight size={16}/></button>
     </div>
-    <SectionHead title="Training this week" action={`${workouts.length} completed`} onClick={() => navigate("/progress")} />
-    <div className="train-week">{["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].map((day, i) => <div key={day} className={i === 0 ? "active" : i < 3 ? "complete" : ""}><span>{day.slice(0,1)}</span><b>{7+i}</b>{i < 3 && <i><Check size={9}/></i>}</div>)}</div>
+    <SectionHead title="Training this week" action={`${workoutsInLastDays(workouts, 7).length} completed`} onClick={() => navigate("/progress")} />
+    <div className="train-week">{weekDates.map(day => { const done = workouts.some(workout => workout.date === day.key); return <div key={day.key} className={`${day.key === localDate() ? "active" : ""} ${done ? "complete" : ""}`}><span>{day.label}</span><b>{day.number}</b>{done && <i><Check size={9}/></i>}</div> })}</div>
     <div className="generator-strip"><span><Sparkles size={18}/></span><div><strong>Need a different plan?</strong><small>Generate one from your goal and gym access.</small></div><button onClick={() => setGenerator(true)}>Build</button></div>
     <SectionHead title="Your weekly split" action={`${routines.length} sessions`} />
     <div className="routine-list">{routines.map(r => <RoutineCard key={r.id} routine={r} onClick={() => navigate(`/routines/${r.id}`)} />)}</div>
@@ -269,58 +337,101 @@ function RoutineDetail({ routines, setRoutines }: AppProps) {
   const { id } = useParams(); const navigate = useNavigate(); const routine = routines.find(x => x.id === id);
   const [adding, setAdding] = useState(false); const [query, setQuery] = useState("");
   const [preview, setPreview] = useState<(typeof exercises)[number] | null>(null); const [saved, setSaved] = useState(false);
+  const [draft, setDraft] = useState<Routine>(() => routine ?? starterRoutines[0]);
+  useEffect(() => { if (routine) setDraft(routine); }, [routine]);
   if (!routine) return <Navigate to="/routines" replace />;
-  const markChanged = () => setSaved(false);
-  const update = (index: number, key: keyof RoutineExercise, value: number) => { markChanged(); setRoutines(routines.map(r => r.id !== routine.id ? r : { ...r, exercises: r.exercises.map((ex, i) => i === index ? { ...ex, [key]: value } : ex) })); };
-  const remove = (index: number) => { markChanged(); setRoutines(routines.map(r => r.id !== routine.id ? r : { ...r, exercises: r.exercises.filter((_, i) => i !== index) })); };
+  const dirty = JSON.stringify(draft) !== JSON.stringify(routine);
+  const update = (index: number, key: keyof RoutineExercise, value: number) => { setSaved(false); setDraft({ ...draft, exercises: draft.exercises.map((ex, i) => i === index ? { ...ex, [key]: value } : ex) }); };
+  const remove = (index: number) => { setSaved(false); setDraft({ ...draft, exercises: draft.exercises.filter((_, i) => i !== index) }); };
   const add = (exerciseId: string) => {
-    if (routine.exercises.some(x => x.exerciseId === exerciseId)) return;
-    markChanged();
-    setRoutines(routines.map(r => r.id !== routine.id ? r : { ...r, exercises: [...r.exercises, { exerciseId, sets: 3, reps: 10, rest: 60, weight: 0 }] }));
+    if (draft.exercises.some(x => x.exerciseId === exerciseId)) return;
+    setSaved(false);
+    setDraft({ ...draft, exercises: [...draft.exercises, { exerciseId, sets: 3, reps: 10, rest: 60, weight: 0 }] });
   };
+  const saveDraft = () => {
+    setRoutines(routines.map(item => item.id === routine.id ? draft : item));
+    setSaved(true);
+    window.setTimeout(() => setSaved(false), 2200);
+  };
+  const leave = () => { if (!dirty || window.confirm("Discard your unsaved routine changes?")) navigate("/routines"); };
+  const startWorkout = () => { if (dirty) setRoutines(routines.map(item => item.id === routine.id ? draft : item)); navigate(`/workout/${routine.id}`); };
   const choices = exercises.filter(ex => `${ex.name} ${ex.muscle} ${ex.equipment}`.toLowerCase().includes(query.toLowerCase()));
-  return <div className="detail-page routine-detail"><button className="back-button" onClick={() => navigate(-1)}><ArrowLeft size={19} /></button><div className="routine-title" style={{ background: routine.color }}><span className="pill">{routine.day}</span><h1>{routine.name}</h1><p>{routine.focus} · {routine.duration} min</p><div className="big-dumbbell"><Dumbbell size={70} /></div></div><div className="detail-body">
-    <div className="routine-edit-head"><div><h2>{routine.exercises.length} exercises</h2><span>Add, remove, or adjust your plan.</span></div><button onClick={() => setAdding(true)}><Plus size={16}/> Add exercise</button></div>
-    <div className="routine-exercises">{routine.exercises.map((item, index) => { const ex = exercises.find(x => x.id === item.exerciseId)!; return <div className="routine-exercise" key={`${item.exerciseId}-${index}`}><button className="exercise-preview-button" aria-label={`Preview ${ex.name}`} onClick={() => setPreview(ex)}><ExerciseArt exercise={ex}/><span>View</span></button><div className="routine-exercise-head"><span>{index + 1}. {ex.muscle}</span><strong>{ex.name}</strong></div><button aria-label={`Remove ${ex.name}`} title={`Remove ${ex.name}`} className="remove-exercise" onClick={() => remove(index)}><X size={14} /><span>Remove</span></button><div className="set-fields"><MiniInput label="Sets" value={item.sets} onChange={v => update(index, "sets", v)} /><MiniInput label="Reps" value={item.reps} onChange={v => update(index, "reps", v)} /><MiniInput label="Kg" value={item.weight} onChange={v => update(index, "weight", v)} /><MiniInput label="Rest" value={item.rest} onChange={v => update(index, "rest", v)} /></div></div> })}</div>
-    <button className={saved ? "btn success wide update-plan" : "btn ghost wide update-plan"} onClick={() => { setSaved(true); window.setTimeout(() => setSaved(false), 2200); }}>{saved ? <><Check size={17}/> Plan updated</> : <><Pencil size={16}/> Update plan</>}</button>
-    <button className="btn dark wide" onClick={() => navigate(`/workout/${routine.id}`)}><Play size={17} fill="white" /> Start workout</button>
-  </div>{adding && <Modal onClose={() => { setAdding(false); setQuery(""); }}><div><span className="eyebrow">Edit {routine.name}</span><h2>Add an exercise</h2><div className="quick-search"><Search size={17}/><input autoFocus value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search exercises or equipment"/></div><div className="add-exercise-list">{choices.slice(0,20).map(ex=>{const exists=routine.exercises.some(x=>x.exerciseId===ex.id);return <button key={ex.id} disabled={exists} onClick={()=>add(ex.id)}><ExerciseArt exercise={ex}/><div><strong>{ex.name}</strong><small>{ex.muscle} · {ex.equipment}</small></div><span>{exists?<Check size={16}/>:<Plus size={16}/>}</span></button>})}</div></div></Modal>}{preview && <Modal onClose={() => setPreview(null)}><div className="exercise-pop"><img src={preview.image} alt={`${preview.name} demonstration`}/><span className="eyebrow">{preview.muscle} · {preview.equipment}</span><h2>{preview.name}</h2><p>{preview.safety}</p><button className="btn dark wide" onClick={() => setPreview(null)}>Close preview</button></div></Modal>}</div>;
+  return <div className="detail-page routine-detail"><button aria-label="Back to routines" className="back-button" onClick={leave}><ArrowLeft size={19} /></button><div className="routine-title" style={{ background: draft.color }}><span className="pill">{draft.day}</span><h1>{draft.name}</h1><p>{draft.focus} · {draft.duration} min</p><div className="big-dumbbell"><Dumbbell size={70} /></div></div><div className="detail-body">
+    <div className="routine-edit-head"><div><h2>{draft.exercises.length} exercises</h2><span>{dirty ? "Unsaved changes" : "Add, remove, or adjust your plan."}</span></div><button onClick={() => setAdding(true)}><Plus size={16}/> Add exercise</button></div>
+    <div className="routine-exercises">{draft.exercises.map((item, index) => { const ex = exercises.find(x => x.id === item.exerciseId)!; return <div className="routine-exercise" key={`${item.exerciseId}-${index}`}><button className="exercise-preview-button" aria-label={`Preview ${ex.name}`} onClick={() => setPreview(ex)}><ExerciseArt exercise={ex}/><span>View</span></button><div className="routine-exercise-head"><span>{index + 1}. {ex.muscle}</span><strong>{ex.name}</strong></div><button aria-label={`Remove ${ex.name}`} title={`Remove ${ex.name}`} className="remove-exercise" onClick={() => remove(index)}><X size={14} /><span>Remove</span></button><div className="set-fields"><MiniInput label="Sets" value={item.sets} onChange={v => update(index, "sets", v)} /><MiniInput label="Reps" value={item.reps} onChange={v => update(index, "reps", v)} /><MiniInput label="Kg" value={item.weight} onChange={v => update(index, "weight", v)} /><MiniInput label="Rest" value={item.rest} onChange={v => update(index, "rest", v)} /></div></div> })}</div>
+    <button disabled={!dirty} className={saved ? "btn success wide update-plan" : "btn ghost wide update-plan"} onClick={saveDraft}>{saved ? <><Check size={17}/> Plan updated</> : <><Pencil size={16}/> {dirty ? "Update plan" : "Plan is up to date"}</>}</button>
+    <button className="btn dark wide" onClick={startWorkout}><Play size={17} fill="white" /> Start workout</button>
+  </div>{adding && <Modal onClose={() => { setAdding(false); setQuery(""); }}><div><span className="eyebrow">Edit {draft.name}</span><h2>Add an exercise</h2><label className="quick-search"><Search size={17}/><span className="sr-only">Search exercises or equipment</span><input autoFocus value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search exercises or equipment"/></label><div className="add-exercise-list">{choices.slice(0,20).map(ex=>{const exists=draft.exercises.some(x=>x.exerciseId===ex.id);return <button key={ex.id} disabled={exists} onClick={()=>add(ex.id)}><ExerciseArt exercise={ex}/><div><strong>{ex.name}</strong><small>{ex.muscle} · {ex.equipment}</small></div><span>{exists?<Check size={16}/>:<Plus size={16}/>}</span></button>})}</div></div></Modal>}{preview && <Modal onClose={() => setPreview(null)}><div className="exercise-pop"><img src={preview.image} alt={`${preview.name} demonstration`}/><span className="eyebrow">{preview.muscle} · {preview.equipment}</span><h2>{preview.name}</h2><p>{preview.safety}</p><button className="btn dark wide" onClick={() => setPreview(null)}>Close preview</button></div></Modal>}</div>;
 }
 
 function ActiveWorkout({ routines, workouts, setWorkouts }: AppProps) {
   const { id } = useParams(); const navigate = useNavigate(); const routine = routines.find(x => x.id === id);
-  const [active, setActive] = useState(0); const [done, setDone] = useState<Record<string, boolean>>({}); const [finished, setFinished] = useState(false);
+  const [active, setActive] = useState(0);
+  const [sets, setSets] = useState<WorkoutSet[]>(() => routine ? routineToWorkoutSets(routine) : []);
+  const [finished, setFinished] = useState(false);
   if (!routine) return <Navigate to="/routines" replace />;
   const item = routine.exercises[active]; const ex = exercises.find(x => x.id === item.exerciseId)!;
-  const toggle = (set: number) => setDone({ ...done, [`${active}-${set}`]: !done[`${active}-${set}`] });
-  const complete = () => { const volume = routine.exercises.reduce((sum, x) => sum + x.sets * x.reps * x.weight, 0); setWorkouts([{ id: `w-${Date.now()}`, routineId: routine.id, date: new Date().toISOString().slice(0,10), duration: routine.duration, volume, completed: 100, personalBests: 1 }, ...workouts]); setFinished(true); };
-  if (finished) return <div className="finish-page"><div className="finish-icon"><Trophy size={52} /></div><span className="eyebrow">Workout complete</span><h1>Strong work.</h1><p>You showed up and finished {routine.name}.</p><div className="finish-stats"><StatCard icon={<Clock3 />} value={`${routine.duration} min`} label="Duration" tone="orange" /><StatCard icon={<Weight />} value={`${(routine.exercises.reduce((s,x) => s+x.sets*x.reps*x.weight,0)/1000).toFixed(1)}t`} label="Volume" tone="blue" /><StatCard icon={<Award />} value="1 new" label="Personal best" tone="green" /></div><button className="btn dark" onClick={() => navigate("/progress")}>View progress <ArrowRight size={17} /></button></div>;
-  return <div className="workout-page"><header><button onClick={() => navigate(-1)}><X size={20} /></button><div><span>{routine.name}</span><strong>{active + 1} of {routine.exercises.length}</strong></div><button className="text-button" onClick={complete}>Finish</button></header><div className="workout-progress"><i style={{ width: `${((active + 1) / routine.exercises.length) * 100}%` }} /></div><main><ExerciseArt exercise={ex} large /><span className="eyebrow">{ex.muscle} · {ex.equipment}</span><h1>{ex.name}</h1><p className="form-tip">{ex.safety}</p><div className="set-table"><div className="set-row heading"><span>Set</span><span>Previous</span><span>Kg</span><span>Reps</span><span /></div>{Array.from({ length: item.sets }).map((_, i) => <div className={done[`${active}-${i}`] ? "set-row complete" : "set-row"} key={i}><b>{i + 1}</b><span>{item.weight} × {item.reps}</span><input defaultValue={item.weight} type="number" /><input defaultValue={item.reps} type="number" /><button onClick={() => toggle(i)}><Check size={17} /></button></div>)}</div><button className="add-set"><Plus size={16} /> Add set</button></main><footer><button className="btn ghost" disabled={active === 0} onClick={() => setActive(active - 1)}><ArrowLeft size={17} /> Previous</button>{active < routine.exercises.length - 1 ? <button className="btn dark" onClick={() => setActive(active + 1)}>Next exercise <ArrowRight size={17} /></button> : <button className="btn dark" onClick={complete}>Finish workout <Check size={17} /></button>}</footer></div>;
+  const activeSets = sets.filter(set => set.exerciseId === item.exerciseId);
+  const completedSets = sets.filter(set => set.completed);
+  const updateSet = (setNumber: number, patch: Partial<WorkoutSet>) =>
+    setSets(sets.map(set => set.exerciseId === item.exerciseId && set.setNumber === setNumber ? { ...set, ...patch } : set));
+  const addSet = () => setSets([...sets, {
+    exerciseId: item.exerciseId,
+    setNumber: activeSets.length + 1,
+    reps: activeSets[activeSets.length - 1]?.reps ?? item.reps,
+    weight: activeSets[activeSets.length - 1]?.weight ?? item.weight,
+    completed: false,
+  }]);
+  const complete = () => {
+    if (!completedSets.length) return;
+    const previousBest = new Map<string, number>();
+    workouts.flatMap(workout => workout.sets ?? []).filter(set => set.completed).forEach(set => {
+      previousBest.set(set.exerciseId, Math.max(previousBest.get(set.exerciseId) ?? 0, set.weight * set.reps));
+    });
+    const personalBests = new Set(completedSets.filter(set => set.weight * set.reps > (previousBest.get(set.exerciseId) ?? 0)).map(set => set.exerciseId)).size;
+    const calories = Math.round(routine.exercises.reduce((sum, exercise) => {
+      const detail = exercises.find(value => value.id === exercise.exerciseId);
+      return sum + (detail?.caloriesPerMinute ?? 5) * (routine.duration / routine.exercises.length);
+    }, 0));
+    setWorkouts([{
+      id: `w-${Date.now()}`, routineId: routine.id, date: localDate(), duration: routine.duration,
+      volume: workoutVolume(sets), completed: workoutCompletion(sets), personalBests, calories, sets,
+    }, ...workouts]);
+    setFinished(true);
+  };
+  if (finished) return <div className="finish-page"><div className="finish-icon"><Trophy size={52} /></div><span className="eyebrow">Workout complete</span><h1>Strong work.</h1><p>You completed {completedSets.length} of {sets.length} sets in {routine.name}.</p><div className="finish-stats"><StatCard icon={<Clock3 />} value={`${routine.duration} min`} label="Duration" tone="orange" /><StatCard icon={<Weight />} value={`${(workoutVolume(sets)/1000).toFixed(1)}t`} label="Volume" tone="blue" /><StatCard icon={<Award />} value={`${workoutCompletion(sets)}%`} label="Completed" tone="green" /></div><button className="btn dark" onClick={() => navigate("/progress")}>View progress <ArrowRight size={17} /></button></div>;
+  return <div className="workout-page"><header><button aria-label="Close workout" onClick={() => navigate(`/routines/${routine.id}`)}><X size={20} /></button><div><span>{routine.name}</span><strong>{completedSets.length} of {sets.length} sets complete</strong></div><button className="text-button" disabled={!completedSets.length} onClick={complete}>Finish</button></header><div className="workout-progress"><i style={{ width: `${workoutCompletion(sets)}%` }} /></div><main><ExerciseArt exercise={ex} large /><span className="eyebrow">{ex.muscle} · {ex.equipment}</span><h1>{ex.name}</h1><p className="form-tip">{ex.safety}</p><div className="set-table"><div className="set-row heading"><span>Set</span><span>Previous</span><span>Kg</span><span>Reps</span><span /></div>{activeSets.map(set => <div className={set.completed ? "set-row complete" : "set-row"} key={set.setNumber}><b>{set.setNumber}</b><span>{item.weight} × {item.reps}</span><input aria-label={`Set ${set.setNumber} weight in kilograms`} value={set.weight} min="0" type="number" onChange={event => updateSet(set.setNumber, { weight: Math.max(0, +event.target.value) })} /><input aria-label={`Set ${set.setNumber} repetitions`} value={set.reps} min="0" type="number" onChange={event => updateSet(set.setNumber, { reps: Math.max(0, +event.target.value) })} /><button aria-label={`Mark set ${set.setNumber} complete`} onClick={() => updateSet(set.setNumber, { completed: !set.completed })}><Check size={17} /></button></div>)}</div><button className="add-set" onClick={addSet}><Plus size={16} /> Add set</button></main><footer><button className="btn ghost" disabled={active === 0} onClick={() => setActive(active - 1)}><ArrowLeft size={17} /> Previous</button>{active < routine.exercises.length - 1 ? <button className="btn dark" onClick={() => setActive(active + 1)}>Next exercise <ArrowRight size={17} /></button> : <button className="btn dark" disabled={!completedSets.length} onClick={complete}>Finish workout <Check size={17} /></button>}</footer></div>;
 }
 
 function ProgressPage({ profile, workouts, routines }: AppProps) {
-  const max = Math.max(...workouts.map(x => x.volume));
-  return <><AppHeader title="Your progress" /><p className="page-intro">Small wins, clearly visible.</p><div className="progress-hero"><div><span className="eyebrow">Training volume</span><h1>{(workouts.reduce((s,x) => s+x.volume,0)/1000).toFixed(1)}t</h1><p>+12% from last month</p></div><TrendingUp size={42} /></div><div className="chart-card"><SectionHead title="Last 7 sessions" action="Volume (kg)" /><div className="bar-chart">{[2800,3600,3300,...workouts.map(x=>x.volume)].slice(-7).map((x,i) => <div key={i}><span style={{ height: `${(x/max)*100}%` }} className={i === 6 ? "current" : ""} /><small>{["M","T","W","T","F","S","S"][i]}</small></div>)}</div></div><div className="stat-grid"><StatCard icon={<Flame />} value="5 days" label="Best streak" tone="orange" /><StatCard icon={<Trophy />} value="7" label="Personal bests" tone="green" /><StatCard icon={<Activity />} value="12" label="Workouts" tone="blue" /></div><SectionHead title="Body progress" action="Last 30 days" /><div className="body-progress"><div><span>Current weight</span><strong>{profile.weight}<small> kg</small></strong><em>-1.8 kg</em></div><div className="weight-line"><i /><i /><i /><i /><i /></div><div className="target-row"><span>Start 78.2 kg</span><span>Goal {profile.targetWeight} kg</span></div></div><SectionHead title="Recent workouts" action={`${workouts.length} logged`} /><div className="history-list">{workouts.map(w => { const r=routines.find(x=>x.id===w.routineId) || {name:"Custom Flow",focus:"Full body"}; return <div key={w.id}><span className="history-icon"><Dumbbell size={19} /></span><div><strong>{r.name}</strong><small>{w.date} · {w.duration} min</small></div><div><b>{(w.volume/1000).toFixed(1)}t</b><small>{w.personalBests ? `${w.personalBests} PB` : "Complete"}</small></div></div>})}</div></>;
+  const sessions = [...workouts].slice(0, 7).reverse();
+  const max = Math.max(1, ...sessions.map(workout => workout.volume));
+  const change = volumeChangePercent(workouts);
+  const goalDistance = Math.abs(profile.weight - profile.targetWeight).toFixed(1);
+  return <><AppHeader title="Your progress" /><p className="page-intro">Every number below comes from completed workouts.</p><div className="progress-hero"><div><span className="eyebrow">Training volume</span><h1>{(workouts.reduce((s,x) => s+x.volume,0)/1000).toFixed(1)}t</h1><p>{change > 0 ? "+" : ""}{change}% versus prior 30 days</p></div><TrendingUp size={42} /></div><div className="chart-card"><SectionHead title="Last 7 sessions" action="Volume (kg)" /><div className="bar-chart">{sessions.map((workout,i) => <div key={workout.id}><span style={{ height: `${(workout.volume/max)*100}%` }} className={i === sessions.length - 1 ? "current" : ""} /><small>{new Date(`${workout.date}T12:00:00`).toLocaleDateString("en-US", { weekday: "narrow" })}</small></div>)}</div>{!sessions.length && <Empty title="No workouts yet" text="Complete a workout to start your progress chart." />}</div><div className="stat-grid"><StatCard icon={<Flame />} value={`${currentStreak(workouts)} days`} label="Current streak" tone="orange" /><StatCard icon={<Trophy />} value={`${countPersonalBests(workouts)}`} label="Personal bests" tone="green" /><StatCard icon={<Activity />} value={`${workouts.length}`} label="Workouts" tone="blue" /></div><SectionHead title="Body goal" action="Current profile" /><div className="body-progress"><div><span>Current weight</span><strong>{profile.weight}<small> kg</small></strong><em>{goalDistance} kg from target</em></div><div className="target-row"><span>Update weight in Profile</span><span>Goal {profile.targetWeight} kg</span></div></div><SectionHead title="Recent workouts" action={`${workouts.length} logged`} /><div className="history-list">{workouts.map(w => { const r=routines.find(x=>x.id===w.routineId) || {name:"Custom Flow",focus:"Full body"}; return <div key={w.id}><span className="history-icon"><Dumbbell size={19} /></span><div><strong>{r.name}</strong><small>{w.date} · {w.duration} min · {w.completed}%</small></div><div><b>{(w.volume/1000).toFixed(1)}t</b><small>{w.personalBests ? `${w.personalBests} PB` : "Logged"}</small></div></div>})}</div></>;
 }
 
 function CaloriesPage({ calories, setCalories, workouts }: AppProps) {
   const [name, setName] = useState(""); const [amount, setAmount] = useState("");
-  const food = calories.filter(x=>x.type==="food").reduce((s,x)=>s+x.calories,0);
-  const burned = calories.filter(x=>x.type==="exercise").reduce((s,x)=>s+x.calories,0) + workouts.reduce((s,x)=>s+(x.calories||0),0);
+  const today = localDate();
+  const todayEntries = calories.filter(entry => entry.date === today);
+  const food = todayEntries.filter(x=>x.type==="food").reduce((s,x)=>s+x.calories,0);
+  const burned = todayEntries.filter(x=>x.type==="exercise").reduce((s,x)=>s+x.calories,0) + workouts.filter(workout => workout.date === today).reduce((s,x)=>s+(x.calories||0),0);
   const target = 2200; const net = food - burned;
-  const addFood = (e: FormEvent) => { e.preventDefault(); if(!name || !amount) return; setCalories([{id:`c-${Date.now()}`,date:new Date().toISOString().slice(0,10),name,calories:+amount,type:"food"},...calories]); setName(""); setAmount(""); };
+  const addFood = (e: FormEvent) => { e.preventDefault(); if(!name || !amount) return; setCalories([{id:`c-${Date.now()}`,date:today,name,calories:+amount,type:"food"},...calories]); setName(""); setAmount(""); };
   return <><AppHeader title="Calories"/><p className="page-intro">A simple energy view, connected to your training.</p>
     <div className="calorie-hero"><div><span>Net calories</span><h1>{net}</h1><small>{target-net} kcal remaining</small></div><div className="calorie-ring" style={{"--fill":`${Math.min(100,(net/target)*100)}%`} as CSSProperties}><strong>{Math.round((net/target)*100)}%</strong></div></div>
     <div className="calorie-metrics"><div><span>Eaten</span><strong>{food} kcal</strong></div><div><span>Burned</span><strong>{burned} kcal</strong></div><div><span>Target</span><strong>{target} kcal</strong></div></div>
-    <SectionHead title="Quick add food"/><form className="calorie-form" onSubmit={addFood}><input placeholder="Meal or food" value={name} onChange={e=>setName(e.target.value)}/><input type="number" placeholder="kcal" value={amount} onChange={e=>setAmount(e.target.value)}/><button><Plus size={17}/></button></form>
-    <SectionHead title="Today’s entries" action={`${calories.length} entries`}/><div className="calorie-list">{calories.map(x=><div key={x.id}><span className={x.type}><Flame size={16}/></span><div><strong>{x.name}</strong><small>{x.type==="food"?"Food":"Exercise"}</small></div><b>{x.type==="food"?"+":"-"}{x.calories} kcal</b></div>)}</div>
+    <SectionHead title="Quick add food"/><form className="calorie-form" onSubmit={addFood}><label><span className="sr-only">Meal or food</span><input placeholder="Meal or food" value={name} onChange={e=>setName(e.target.value)}/></label><label><span className="sr-only">Calories</span><input type="number" placeholder="kcal" value={amount} onChange={e=>setAmount(e.target.value)}/></label><button aria-label="Add food entry"><Plus size={17}/></button></form>
+    <SectionHead title="Today’s entries" action={`${todayEntries.length} entries`}/><div className="calorie-list">{todayEntries.map(x=><div key={x.id}><span className={x.type}><Flame size={16}/></span><div><strong>{x.name}</strong><small>{x.type==="food"?"Food":"Exercise"}</small></div><b>{x.type==="food"?"+":"-"}{x.calories} kcal</b></div>)}</div>
   </>;
 }
 
 function ProfilePage({ profile, setProfile, routines, workouts, onLogout }: AppProps & { onLogout: () => void | Promise<void> }) {
+  const navigate = useNavigate();
   const [editing, setEditing] = useState(false); const [draft, setDraft] = useState(profile);
   const save = () => { setProfile(draft); setEditing(false); };
-  return <><AppHeader title="Profile" /><div className="profile-hero"><div className="profile-avatar">{profile.name.split(" ").map(x=>x[0]).join("").slice(0,2)}</div><h1>{profile.name}</h1><p>{profile.goal} · {profile.experience}</p><button onClick={() => setEditing(true)}><Pencil size={15} /> Edit profile</button></div><div className="profile-metrics"><div><span>Current</span><strong>{profile.weight} kg</strong></div><div><span>Target</span><strong>{profile.targetWeight} kg</strong></div><div><span>Frequency</span><strong>{profile.frequency}× week</strong></div></div><SectionHead title="Training profile" /><div className="settings-list"><ProfileRow icon={<Target />} label="Primary goal" value={profile.goal} /><ProfileRow icon={<Activity />} label="Experience" value={profile.experience} /><ProfileRow icon={<Dumbbell />} label="Equipment" value={`${profile.equipment.length} types`} /><ProfileRow icon={<CalendarDays />} label="Saved routines" value={`${routines.length}`} /><ProfileRow icon={<Trophy />} label="Completed workouts" value={`${workouts.length}`} /></div><button className="logout" onClick={onLogout}><LogOut size={18} /> Log out</button>{editing && <Modal onClose={() => setEditing(false)}><div><span className="eyebrow">Profile details</span><h2>Edit your profile</h2><div className="form-grid"><Field label="Name"><input value={draft.name} onChange={e=>setDraft({...draft,name:e.target.value})}/></Field><Field label="Current weight"><input type="number" value={draft.weight} onChange={e=>setDraft({...draft,weight:+e.target.value})}/></Field><Field label="Target weight"><input type="number" value={draft.targetWeight} onChange={e=>setDraft({...draft,targetWeight:+e.target.value})}/></Field><Field label="Training goal"><select value={draft.goal} onChange={e=>setDraft({...draft,goal:e.target.value})}><option>Build muscle</option><option>Lose fat</option><option>Get stronger</option><option>Stay active</option></select></Field><Field label="Injuries / limitations"><textarea value={draft.injuries} onChange={e=>setDraft({...draft,injuries:e.target.value})}/></Field></div><button className="btn dark wide" onClick={save}><Check size={17}/> Save changes</button></div></Modal>}</>;
+  return <><AppHeader title="Profile" /><div className="profile-hero"><div className="profile-avatar">{profile.name.split(" ").map(x=>x[0]).join("").slice(0,2)}</div><h1>{profile.name}</h1><p>{profile.goal} · {profile.experience}</p><button onClick={() => setEditing(true)}><Pencil size={15} /> Edit profile</button></div><div className="profile-metrics"><div><span>Current</span><strong>{profile.weight} kg</strong></div><div><span>Target</span><strong>{profile.targetWeight} kg</strong></div><div><span>Frequency</span><strong>{profile.frequency}× week</strong></div></div><SectionHead title="Training profile" /><div className="settings-list"><ProfileRow icon={<Target />} label="Primary goal" value={profile.goal} /><ProfileRow icon={<Activity />} label="Experience" value={profile.experience} /><ProfileRow icon={<Dumbbell />} label="Equipment" value={`${profile.equipment.length} types`} /><ProfileRow icon={<CalendarDays />} label="Saved routines" value={`${routines.length}`} /><ProfileRow icon={<Trophy />} label="Completed workouts" value={`${workouts.length}`} /><ProfileRow icon={<Flame />} label="Calories" value="Open daily tracker" onClick={() => navigate("/calories")} /></div><button className="logout" onClick={onLogout}><LogOut size={18} /> Log out</button>{editing && <Modal onClose={() => setEditing(false)}><div><span className="eyebrow">Profile details</span><h2>Edit your profile</h2><div className="form-grid"><Field label="Name"><input value={draft.name} onChange={e=>setDraft({...draft,name:e.target.value})}/></Field><Field label="Current weight"><input type="number" value={draft.weight} onChange={e=>setDraft({...draft,weight:+e.target.value})}/></Field><Field label="Target weight"><input type="number" value={draft.targetWeight} onChange={e=>setDraft({...draft,targetWeight:+e.target.value})}/></Field><Field label="Training goal"><select value={draft.goal} onChange={e=>setDraft({...draft,goal:e.target.value})}><option>Build muscle</option><option>Lose fat</option><option>Get stronger</option><option>Stay active</option></select></Field><Field label="Injuries / limitations"><textarea value={draft.injuries} onChange={e=>setDraft({...draft,injuries:e.target.value})}/></Field></div><button className="btn dark wide" onClick={save}><Check size={17}/> Save changes</button></div></Modal>}</>;
 }
 
 const equipmentImages: Record<string, string> = {
@@ -335,13 +446,39 @@ const equipmentImages: Record<string, string> = {
 };
 function EquipmentImage({ equipment }: { equipment: string }) { return <img src={equipmentImages[equipment] || equipmentImages.All} alt={`${equipment} gym equipment`} loading="lazy" />; }
 function ExerciseArt({ exercise, large }: { exercise: typeof exercises[number]; large?: boolean }) { return <div className={large ? "exercise-art large" : "exercise-art"} style={{ background: exercise.color }}><img src={exercise.image} alt={`${exercise.name} demonstration`} loading="lazy" onError={e=>{e.currentTarget.src=equipmentImages[exercise.equipment]||equipmentImages.All}}/><div className="art-shade"/><span className="art-equipment">{exercise.name}</span></div>; }
-function SectionHead({ title, action, onClick }: { title: string; action?: string; onClick?: () => void }) { return <div className="section-head"><h2>{title}</h2>{action && <button onClick={onClick}>{action}{onClick && <ChevronRight size={15}/>}</button>}</div>; }
+function SectionHead({ title, action, onClick }: { title: string; action?: string; onClick?: () => void }) { return <div className="section-head"><h2>{title}</h2>{action && (onClick ? <button onClick={onClick}>{action}<ChevronRight size={15}/></button> : <span>{action}</span>)}</div>; }
 function StatCard({ icon, value, label, tone }: { icon: ReactNode; value: string; label: string; tone: string }) { return <div className={`stat-card ${tone}`}><span>{icon}</span><strong>{value}</strong><small>{label}</small></div>; }
 function RoutineCard({ routine, onClick }: { routine: Routine; onClick: () => void }) { const preview=exercises.find(x=>x.id===routine.exercises[0]?.exerciseId); return <button className="routine-card" style={{ background: routine.color }} onClick={onClick}><div><span>{routine.day}</span><h3>{routine.name}</h3><p>{routine.focus}</p><small><Clock3 size={13}/>{routine.duration} min · {routine.exercises.length} moves</small></div>{preview&&<img src={preview.image} alt={preview.name}/>}</button>; }
 function Field({ label, children }: { label: string; children: ReactNode }) { return <label className="field"><span>{label}</span>{children}</label>; }
 function MiniInput({ label, value, onChange }: { label: string; value: number; onChange: (v: number) => void }) { return <label><span>{label}</span><input type="number" value={value} onChange={e=>onChange(+e.target.value)}/></label>; }
 function Empty({ title, text }: { title: string; text: string }) { return <div className="empty"><Search size={28}/><h3>{title}</h3><p>{text}</p></div>; }
-function Modal({ children, onClose }: { children: ReactNode; onClose: () => void }) { return <div className="modal-backdrop" onMouseDown={onClose}><div className="modal" onMouseDown={e=>e.stopPropagation()}><button className="modal-close" onClick={onClose}><X size={18}/></button>{children}</div></div>; }
-function ProfileRow({ icon, label, value }: { icon: ReactNode; label: string; value: string }) { return <div><span className="row-icon">{icon}</span><strong>{label}</strong><small>{value}</small><ChevronRight size={17}/></div>; }
+function Modal({ children, onClose }: { children: ReactNode; onClose: () => void }) {
+  const dialog = useRef<HTMLDivElement>(null);
+  const previousFocus = useRef<HTMLElement | null>(null);
+  const close = useRef(onClose);
+  close.current = onClose;
+  useEffect(() => {
+    previousFocus.current = document.activeElement as HTMLElement | null;
+    const node = dialog.current;
+    const focusable = node?.querySelector<HTMLElement>("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])");
+    (focusable ?? node)?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close.current();
+      if (event.key !== "Tab" || !node) return;
+      const items = [...node.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])")];
+      if (!items.length) return;
+      const first = items[0]; const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => { document.removeEventListener("keydown", onKeyDown); previousFocus.current?.focus(); };
+  }, []);
+  return <div className="modal-backdrop" onMouseDown={onClose}><div ref={dialog} className="modal" role="dialog" aria-modal="true" aria-label="FitFlow dialog" tabIndex={-1} onMouseDown={e=>e.stopPropagation()}><button aria-label="Close dialog" className="modal-close" onClick={onClose}><X size={18}/></button>{children}</div></div>;
+}
+function ProfileRow({ icon, label, value, onClick }: { icon: ReactNode; label: string; value: string; onClick?: () => void }) {
+  const content = <><span className="row-icon">{icon}</span><strong>{label}</strong><small>{value}</small>{onClick && <ChevronRight size={17}/>}</>;
+  return onClick ? <button className="profile-row-button" onClick={onClick}>{content}</button> : <div>{content}</div>;
+}
 
 export default App;
