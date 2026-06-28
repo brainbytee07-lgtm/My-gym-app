@@ -7,12 +7,12 @@ import {
 } from "lucide-react";
 import { exercises, starterCalories, starterRoutines, starterWorkouts } from "./data";
 import {
-  countPersonalBests, currentStreak, generateRoutine, getTodayRoutine, localDate,
+  applyProgressionDecisions, countPersonalBests, createProgressionDecisions, currentStreak, generateRoutine, getTodayRoutine, localDate,
   routineToWorkoutSets, volumeChangePercent, workoutCompletion, workoutVolume, workoutsInLastDays,
 } from "./fitness";
 import { createCloudStateQueue, loadScopedState, saveScopedState, userStorageScope, type StorageScope } from "./storage";
 import { isSupabaseConfigured, supabase } from "./supabase";
-import type { AuthState, CalorieEntry, FitFlowState, Profile, Routine, RoutineExercise, Workout, WorkoutSet } from "./types";
+import type { AuthState, CalorieEntry, FitFlowState, Profile, ProgressionDecision, Routine, RoutineExercise, Workout, WorkoutSet } from "./types";
 
 const defaultProfile: Profile = {
   name: "Alex Morgan", age: 28, height: 178, weight: 76.4, targetWeight: 72,
@@ -28,10 +28,12 @@ const fallbackState: FitFlowState = {
   routines: starterRoutines,
   workouts: starterWorkouts,
   calories: starterCalories,
+  progressionDecisions: [],
   onboarded: false,
 };
 const validState = (state: FitFlowState): FitFlowState => ({
   ...state,
+  progressionDecisions: state.progressionDecisions ?? [],
   routines: state.routines.length && state.routines.every(r => r.exercises.every(item => exercises.some(ex => ex.id === item.exerciseId))) ? state.routines : starterRoutines,
 });
 
@@ -44,15 +46,17 @@ function App() {
   const [routines, setRoutines] = useState<Routine[]>(initialDemo.routines);
   const [workouts, setWorkouts] = useState<Workout[]>(initialDemo.workouts);
   const [calories, setCalories] = useState<CalorieEntry[]>(initialDemo.calories);
+  const [progressionDecisions, setProgressionDecisions] = useState(initialDemo.progressionDecisions ?? []);
   const [onboarded, setOnboarded] = useState(initialDemo.onboarded);
   const [cloudError, setCloudError] = useState("");
   const cloudQueue = useRef<ReturnType<typeof createCloudStateQueue> | null>(null);
   const skipNextCloudWrite = useRef(false);
   const activeUser = useRef<string | null | undefined>(undefined);
-  const state: FitFlowState = { profile, routines, workouts, calories, onboarded };
+  const state: FitFlowState = { profile, routines, workouts, calories, progressionDecisions, onboarded };
   const applyState = (next: FitFlowState) => {
     const checked = validState(next);
     setProfile(checked.profile); setRoutines(checked.routines); setWorkouts(checked.workouts);
+    setProgressionDecisions(checked.progressionDecisions ?? []);
     setCalories(checked.calories); setOnboarded(checked.onboarded);
   };
 
@@ -80,7 +84,7 @@ function App() {
     const hydrate = async () => {
       const scope = userStorageScope(auth.userId);
       const local = validState(loadScopedState(localStorage, scope, { ...fallbackState, workouts: [], calories: [] }));
-      const { data, error } = await client.from("user_states").select("profile,routines,workouts,calories,onboarded,state_version,updated_at").eq("user_id", auth.userId).maybeSingle() as { data: (FitFlowState & { state_version: number; updated_at: string | null }) | null; error: unknown };
+      const { data, error } = await client.from("user_states").select("profile,routines,workouts,calories,progression_decisions,onboarded,state_version,updated_at").eq("user_id", auth.userId).maybeSingle() as { data: (FitFlowState & { progression_decisions?: typeof progressionDecisions; state_version: number; updated_at: string | null }) | null; error: unknown };
       if (cancelled) return;
       if (error) {
         console.error("FitFlow cloud hydration failed", error);
@@ -89,7 +93,7 @@ function App() {
         setHydrated(true);
         return;
       }
-      const next = data ? validState(data) : local;
+      const next = data ? validState({ ...data, progressionDecisions: data.progression_decisions ?? data.progressionDecisions ?? [] }) : local;
       applyState(next);
       saveScopedState(localStorage, scope, next);
       cloudQueue.current = createCloudStateQueue(data?.state_version ?? 0, async (nextState, expectedVersion) => {
@@ -99,6 +103,7 @@ function App() {
           next_routines: nextState.routines,
           next_workouts: nextState.workouts,
           next_calories: nextState.calories,
+          next_progression_decisions: nextState.progressionDecisions,
           next_onboarded: nextState.onboarded,
         }) as { data: { applied: boolean; new_state_version: number }[] | null; error: unknown };
         if (writeError) throw writeError;
@@ -127,10 +132,10 @@ function App() {
       }
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [profile, routines, workouts, calories, onboarded, signedIn, hydrated, auth]);
+  }, [profile, routines, workouts, calories, progressionDecisions, onboarded, signedIn, hydrated, auth]);
   useEffect(() => { if (!isSupabaseConfigured) localStorage.setItem("fitflow-demo-signed-in", JSON.stringify(signedIn)); }, [signedIn]);
 
-  const app = { profile, setProfile, routines, setRoutines, workouts, setWorkouts, calories, setCalories };
+  const app = { profile, setProfile, routines, setRoutines, workouts, setWorkouts, calories, setCalories, progressionDecisions, setProgressionDecisions };
   if (auth.status === "loading" || (signedIn && !hydrated)) return <div className="app-loading"><Dumbbell size={32} /><strong>Loading your FitFlow...</strong></div>;
   if (!signedIn) return <Login onSignIn={() => setSignedIn(true)} />;
   if (!onboarded) return <Onboarding profile={profile} onComplete={(value) => { setProfile(value); setOnboarded(true); }} />;
@@ -226,10 +231,10 @@ function AppHeader({ profile, title }: { profile?: Profile; title?: string }) {
 }
 
 type AppProps = {
-  profile: Profile; setProfile: (p: Profile) => void; routines: Routine[]; setRoutines: (r: Routine[]) => void; workouts: Workout[]; setWorkouts: (w: Workout[]) => void; calories: CalorieEntry[]; setCalories: (c: CalorieEntry[]) => void;
+  profile: Profile; setProfile: (p: Profile) => void; routines: Routine[]; setRoutines: (r: Routine[]) => void; workouts: Workout[]; setWorkouts: (w: Workout[]) => void; calories: CalorieEntry[]; setCalories: (c: CalorieEntry[]) => void; progressionDecisions: ProgressionDecision[]; setProgressionDecisions: (d: ProgressionDecision[]) => void;
 };
 
-function HomePage({ profile, routines, workouts, calories }: AppProps) {
+function HomePage({ profile, routines, workouts, calories, progressionDecisions }: AppProps) {
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
   const today = getTodayRoutine(routines);
@@ -238,6 +243,7 @@ function HomePage({ profile, routines, workouts, calories }: AppProps) {
   const weekWorkouts = workoutsInLastDays(workouts, 7);
   const streak = currentStreak(workouts);
   const volumeChange = volumeChangePercent(workouts);
+  const latestDecision = progressionDecisions.find(decision => decision.status === "pending");
   const weekDates = Array.from({ length: 7 }, (_, index) => {
     const date = new Date();
     date.setDate(date.getDate() - date.getDay() + 1 + index);
@@ -256,6 +262,7 @@ function HomePage({ profile, routines, workouts, calories }: AppProps) {
       <StatCard icon={<Target />} value={`${weekWorkouts.length}/${profile.frequency}`} label="Workouts done" tone="blue" />
       <StatCard icon={<TrendingUp />} value={`${volumeChange > 0 ? "+" : ""}${volumeChange}%`} label="30-day volume" tone="green" />
     </div>
+    {latestDecision && <button className="coach-summary" onClick={() => navigate(`/routines/${latestDecision.routineId}`)}><span><Sparkles size={19}/></span><div><small>Smarter next workout</small><strong>{latestDecision.exerciseName}: {latestDecision.action === "increase_load" ? `try ${latestDecision.nextWeight} kg` : latestDecision.action === "reduce_load" ? `drop to ${latestDecision.nextWeight} kg` : "review target"}</strong></div><ChevronRight size={17}/></button>}
     <button className="calorie-summary" onClick={() => navigate("/calories")}><span><Flame size={19}/></span><div><small>Calories today</small><strong>{todayCalories.filter(x=>x.type==="food").reduce((s,x)=>s+x.calories,0)} eaten · {todayCalories.filter(x=>x.type==="exercise").reduce((s,x)=>s+x.calories,0)} burned</strong></div><ChevronRight size={17}/></button>
     <div className="week-card"><div className="week-score"><strong>{Math.min(100, Math.round((weekWorkouts.length / profile.frequency) * 100))}%</strong><span>weekly goal</span></div><div className="days">{weekDates.map(day => { const done = workouts.some(workout => workout.date === day.key); return <div key={day.key} className={done ? "done" : ""}><i>{done && <Check size={12} />}</i><span>{day.label}</span></div> })}</div></div>
     <SectionHead title="Your plan" action="See all" onClick={() => navigate("/routines")} />
@@ -364,11 +371,11 @@ function RoutineDetail({ routines, setRoutines }: AppProps) {
   </div>{adding && <Modal onClose={() => { setAdding(false); setQuery(""); }}><div><span className="eyebrow">Edit {draft.name}</span><h2>Add an exercise</h2><label className="quick-search"><Search size={17}/><span className="sr-only">Search exercises or equipment</span><input autoFocus value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search exercises or equipment"/></label><div className="add-exercise-list">{choices.slice(0,20).map(ex=>{const exists=draft.exercises.some(x=>x.exerciseId===ex.id);return <button key={ex.id} disabled={exists} onClick={()=>add(ex.id)}><ExerciseArt exercise={ex}/><div><strong>{ex.name}</strong><small>{ex.muscle} · {ex.equipment}</small></div><span>{exists?<Check size={16}/>:<Plus size={16}/>}</span></button>})}</div></div></Modal>}{preview && <Modal onClose={() => setPreview(null)}><div className="exercise-pop"><img src={preview.image} alt={`${preview.name} demonstration`}/><span className="eyebrow">{preview.muscle} · {preview.equipment}</span><h2>{preview.name}</h2><p>{preview.safety}</p><button className="btn dark wide" onClick={() => setPreview(null)}>Close preview</button></div></Modal>}</div>;
 }
 
-function ActiveWorkout({ routines, workouts, setWorkouts }: AppProps) {
+function ActiveWorkout({ routines, setRoutines, workouts, setWorkouts, progressionDecisions, setProgressionDecisions }: AppProps) {
   const { id } = useParams(); const navigate = useNavigate(); const routine = routines.find(x => x.id === id);
   const [active, setActive] = useState(0);
   const [sets, setSets] = useState<WorkoutSet[]>(() => routine ? routineToWorkoutSets(routine) : []);
-  const [finished, setFinished] = useState(false);
+  const [finishSummary, setFinishSummary] = useState<{ workout: Workout; decisions: ProgressionDecision[] } | null>(null);
   if (!routine) return <Navigate to="/routines" replace />;
   const item = routine.exercises[active]; const ex = exercises.find(x => x.id === item.exerciseId)!;
   const activeSets = sets.filter(set => set.exerciseId === item.exerciseId);
@@ -393,13 +400,25 @@ function ActiveWorkout({ routines, workouts, setWorkouts }: AppProps) {
       const detail = exercises.find(value => value.id === exercise.exerciseId);
       return sum + (detail?.caloriesPerMinute ?? 5) * (routine.duration / routine.exercises.length);
     }, 0));
-    setWorkouts([{
-      id: `w-${Date.now()}`, routineId: routine.id, date: localDate(), duration: routine.duration,
+    const workout: Workout = {
+      id: `w-${Date.now()}`, routineId: routine.id, routineVersion: routine.version ?? 1, date: localDate(), duration: routine.duration,
       volume: workoutVolume(sets), completed: workoutCompletion(sets), personalBests, calories, sets,
-    }, ...workouts]);
-    setFinished(true);
+    };
+    const decisions = createProgressionDecisions(workout, routine, workouts, exercises);
+    setWorkouts([{ ...workout, progressionDecisions: decisions }, ...workouts]);
+    setProgressionDecisions([...decisions, ...progressionDecisions]);
+    setFinishSummary({ workout, decisions });
   };
-  if (finished) return <div className="finish-page"><div className="finish-icon"><Trophy size={52} /></div><span className="eyebrow">Workout complete</span><h1>Strong work.</h1><p>You completed {completedSets.length} of {sets.length} sets in {routine.name}.</p><div className="finish-stats"><StatCard icon={<Clock3 />} value={`${routine.duration} min`} label="Duration" tone="orange" /><StatCard icon={<Weight />} value={`${(workoutVolume(sets)/1000).toFixed(1)}t`} label="Volume" tone="blue" /><StatCard icon={<Award />} value={`${workoutCompletion(sets)}%`} label="Completed" tone="green" /></div><button className="btn dark" onClick={() => navigate("/progress")}>View progress <ArrowRight size={17} /></button></div>;
+  if (finishSummary) {
+    const actionable = finishSummary.decisions.filter(decision => decision.action !== "hold");
+    const acceptProgression = () => {
+      const accepted = finishSummary.decisions.map(decision => ({ ...decision, status: "accepted" as const }));
+      setRoutines(routines.map(item => item.id === routine.id ? applyProgressionDecisions(item, accepted) : item));
+      setProgressionDecisions(progressionDecisions.map(decision => accepted.find(item => item.id === decision.id) ?? decision));
+      navigate(`/routines/${routine.id}`);
+    };
+    return <div className="finish-page"><div className="finish-icon"><Trophy size={52} /></div><span className="eyebrow">Workout complete</span><h1>Next workout updated.</h1><p>You completed {completedSets.length} of {sets.length} sets in {routine.name}. FitFlow compared the plan against what you actually did.</p><div className="finish-stats"><StatCard icon={<Clock3 />} value={`${routine.duration} min`} label="Duration" tone="orange" /><StatCard icon={<Weight />} value={`${(workoutVolume(sets)/1000).toFixed(1)}t`} label="Volume" tone="blue" /><StatCard icon={<Award />} value={`${workoutCompletion(sets)}%`} label="Completed" tone="green" /></div><div className="coach-card"><span className="eyebrow">Adaptive coach</span><h2>{actionable.length ? "Suggested changes" : "Keep this plan"}</h2>{finishSummary.decisions.slice(0, 4).map(decision => <div key={decision.id} className="coach-row"><strong>{decision.exerciseName}</strong><span>{decision.action === "increase_load" ? `Next time: ${decision.nextWeight} kg` : decision.action === "reduce_load" ? `Reduce to ${decision.nextWeight} kg` : decision.action === "review" ? "Review target" : "Hold target"}</span><small>{decision.reason}</small></div>)}</div><div className="finish-actions"><button className="btn ghost" onClick={() => navigate("/progress")}>View progress</button><button className="btn dark" onClick={acceptProgression}>{actionable.length ? "Accept updates" : "Back to plan"} <ArrowRight size={17} /></button></div></div>;
+  }
   return <div className="workout-page"><header><button aria-label="Close workout" onClick={() => navigate(`/routines/${routine.id}`)}><X size={20} /></button><div><span>{routine.name}</span><strong>{completedSets.length} of {sets.length} sets complete</strong></div><button className="text-button" disabled={!completedSets.length} onClick={complete}>Finish</button></header><div className="workout-progress"><i style={{ width: `${workoutCompletion(sets)}%` }} /></div><main><ExerciseArt exercise={ex} large /><span className="eyebrow">{ex.muscle} · {ex.equipment}</span><h1>{ex.name}</h1><p className="form-tip">{ex.safety}</p><div className="set-table"><div className="set-row heading"><span>Set</span><span>Previous</span><span>Kg</span><span>Reps</span><span /></div>{activeSets.map(set => <div className={set.completed ? "set-row complete" : "set-row"} key={set.setNumber}><b>{set.setNumber}</b><span>{item.weight} × {item.reps}</span><input aria-label={`Set ${set.setNumber} weight in kilograms`} value={set.weight} min="0" type="number" onChange={event => updateSet(set.setNumber, { weight: Math.max(0, +event.target.value) })} /><input aria-label={`Set ${set.setNumber} repetitions`} value={set.reps} min="0" type="number" onChange={event => updateSet(set.setNumber, { reps: Math.max(0, +event.target.value) })} /><button aria-label={`Mark set ${set.setNumber} complete`} onClick={() => updateSet(set.setNumber, { completed: !set.completed })}><Check size={17} /></button></div>)}</div><button className="add-set" onClick={addSet}><Plus size={16} /> Add set</button></main><footer><button className="btn ghost" disabled={active === 0} onClick={() => setActive(active - 1)}><ArrowLeft size={17} /> Previous</button>{active < routine.exercises.length - 1 ? <button className="btn dark" onClick={() => setActive(active + 1)}>Next exercise <ArrowRight size={17} /></button> : <button className="btn dark" disabled={!completedSets.length} onClick={complete}>Finish workout <Check size={17} /></button>}</footer></div>;
 }
 

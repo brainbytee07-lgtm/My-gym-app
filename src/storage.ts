@@ -55,6 +55,7 @@ export const migrateLegacyStateToDemo = (
     routines: parse(storage.getItem(legacyKeys.routines)) ?? fallback.routines,
     workouts: parse(storage.getItem(legacyKeys.workouts)) ?? fallback.workouts,
     calories: parse(storage.getItem(legacyKeys.calories)) ?? fallback.calories,
+    progressionDecisions: fallback.progressionDecisions,
     onboarded: parse(storage.getItem(legacyKeys.onboarded)) ?? fallback.onboarded,
   };
 
@@ -70,7 +71,8 @@ export const loadScopedState = (
   fallback: FitFlowState,
 ): FitFlowState => {
   if (scope === "demo") migrateLegacyStateToDemo(storage, fallback);
-  return parse<FitFlowState>(storage.getItem(storageKeyForScope(scope))) ?? fallback;
+  const saved = parse<FitFlowState>(storage.getItem(storageKeyForScope(scope)));
+  return saved ? { ...saved, progressionDecisions: saved.progressionDecisions ?? [] } : fallback;
 };
 
 export const saveScopedState = (

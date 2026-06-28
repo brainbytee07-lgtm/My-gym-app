@@ -1,4 +1,4 @@
-import type { Exercise, Profile, Routine, RoutineExercise, Workout, WorkoutSet } from "./types";
+import type { Exercise, Profile, ProgressionDecision, Routine, RoutineExercise, Workout, WorkoutSet } from "./types";
 
 export const localDate = (date = new Date()) => {
   const offset = date.getTimezoneOffset() * 60_000;
@@ -60,6 +60,89 @@ export const volumeChangePercent = (workouts: Workout[], date = new Date()) => {
 
 export const countPersonalBests = (workouts: Workout[]) =>
   workouts.reduce((sum, workout) => sum + workout.personalBests, 0);
+
+const loadStepFor = (exercise?: Exercise) => {
+  if (!exercise) return 2.5;
+  if (exercise.equipment === "Dumbbell" || exercise.equipment === "Kettlebell") return 1;
+  if (exercise.equipment === "Bodyweight" || exercise.equipment === "Resistance Band") return 0;
+  return 2.5;
+};
+
+const setsForExercise = (sets: WorkoutSet[], exerciseId: string) =>
+  sets.filter(set => set.exerciseId === exerciseId);
+
+const completedTargetSets = (actual: WorkoutSet[], plan: RoutineExercise) =>
+  actual.filter(set => set.completed && set.reps >= plan.reps && set.weight >= plan.weight).length;
+
+const hadRecentMiss = (workouts: Workout[], exerciseId: string, plan: RoutineExercise) =>
+  workouts.slice(0, 2).some(workout => {
+    const actual = setsForExercise(workout.sets ?? [], exerciseId);
+    return actual.length > 0 && completedTargetSets(actual, plan) < Math.ceil(plan.sets * 0.75);
+  });
+
+export const createProgressionDecisions = (
+  workout: Workout,
+  routine: Routine,
+  workouts: Workout[],
+  exerciseCatalog: Exercise[],
+): ProgressionDecision[] => {
+  const createdAt = `${workout.date}T12:00:00.000Z`;
+  return routine.exercises.map(plan => {
+    const exercise = exerciseCatalog.find(item => item.id === plan.exerciseId);
+    const actual = setsForExercise(workout.sets ?? [], plan.exerciseId);
+    const targetSets = completedTargetSets(actual, plan);
+    const step = loadStepFor(exercise);
+    const missed = actual.length === 0 || targetSets < Math.ceil(plan.sets * 0.75);
+    const repeatedMiss = missed && hadRecentMiss(workouts.filter(item => item.routineId === routine.id), plan.exerciseId, plan);
+    const hitAllTargets = targetSets >= plan.sets;
+    const action: ProgressionDecision["action"] = hitAllTargets && step > 0
+      ? "increase_load"
+      : repeatedMiss && plan.weight > step
+        ? "reduce_load"
+        : missed
+          ? "review"
+          : "hold";
+    const nextWeight = action === "increase_load"
+      ? plan.weight + step
+      : action === "reduce_load"
+        ? Math.max(0, plan.weight - step)
+        : plan.weight;
+    const reason = action === "increase_load"
+      ? `Completed all ${plan.sets} planned sets at target reps.`
+      : action === "reduce_load"
+        ? "Missed target reps in two recent sessions."
+        : action === "review"
+          ? "Workout result was below the planned target."
+          : "Performance matched the plan. Keep the same target next time.";
+    return {
+      id: `${workout.id}-${plan.exerciseId}`,
+      workoutId: workout.id,
+      routineId: routine.id,
+      exerciseId: plan.exerciseId,
+      exerciseName: exercise?.name ?? plan.exerciseId,
+      action,
+      currentWeight: plan.weight,
+      nextWeight,
+      reason,
+      status: "pending",
+      createdAt,
+    };
+  });
+};
+
+export const applyProgressionDecisions = (routine: Routine, decisions: ProgressionDecision[]): Routine => {
+  const accepted = new Map(decisions.filter(decision => decision.status === "accepted").map(decision => [decision.exerciseId, decision]));
+  if (!accepted.size) return routine;
+  return {
+    ...routine,
+    version: (routine.version ?? 1) + 1,
+    source: "adapted",
+    exercises: routine.exercises.map(item => {
+      const decision = accepted.get(item.exerciseId);
+      return decision ? { ...item, weight: decision.nextWeight } : item;
+    }),
+  };
+};
 
 const selectBalanced = (pool: Exercise[], count: number) => {
   const selected: Exercise[] = [];

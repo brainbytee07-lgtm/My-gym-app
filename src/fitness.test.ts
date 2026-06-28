@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { exercises, starterRoutines } from "./data";
 import {
-  currentStreak, generateRoutine, getTodayRoutine, routineToWorkoutSets,
+  applyProgressionDecisions, createProgressionDecisions, currentStreak, generateRoutine, getTodayRoutine, routineToWorkoutSets,
   volumeChangePercent, workoutCompletion, workoutVolume, workoutsInLastDays,
 } from "./fitness";
 import type { Profile, Workout, WorkoutSet } from "./types";
@@ -43,6 +43,59 @@ describe("routine generation", () => {
   it("avoids advanced exercises when injuries are recorded", () => {
     const routine = generateRoutine({ ...profile, injuries: "Sensitive shoulder", experience: "Advanced" }, exercises, 1);
     expect(routine.exercises.every(item => exercises.find(exercise => exercise.id === item.exerciseId)?.difficulty !== "Advanced")).toBe(true);
+  });
+});
+
+describe("adaptive progression", () => {
+  it("suggests a load increase when every planned set hits the target", () => {
+    const routine = starterRoutines[0];
+    const bench = routine.exercises[0];
+    const workout: Workout = {
+      id: "w1",
+      routineId: routine.id,
+      date: "2026-06-10",
+      duration: 45,
+      volume: 1000,
+      completed: 100,
+      personalBests: 0,
+      sets: Array.from({ length: bench.sets }, (_, index) => ({
+        exerciseId: bench.exerciseId,
+        setNumber: index + 1,
+        reps: bench.reps,
+        weight: bench.weight,
+        completed: true,
+      })),
+    };
+
+    const decisions = createProgressionDecisions(workout, routine, [], exercises);
+    expect(decisions[0]).toMatchObject({
+      action: "increase_load",
+      currentWeight: bench.weight,
+      nextWeight: bench.weight + 2.5,
+      status: "pending",
+    });
+
+    const updated = applyProgressionDecisions(routine, [{ ...decisions[0], status: "accepted" }]);
+    expect(updated.version).toBe((routine.version ?? 1) + 1);
+    expect(updated.exercises[0].weight).toBe(bench.weight + 2.5);
+  });
+
+  it("suggests reducing load after repeated misses", () => {
+    const routine = starterRoutines[0];
+    const bench = routine.exercises[0];
+    const missedSets: WorkoutSet[] = Array.from({ length: bench.sets }, (_, index) => ({
+      exerciseId: bench.exerciseId,
+      setNumber: index + 1,
+      reps: Math.max(1, bench.reps - 3),
+      weight: bench.weight,
+      completed: index === 0,
+    }));
+    const prior: Workout = { id: "prior", routineId: routine.id, date: "2026-06-09", duration: 45, volume: 100, completed: 25, personalBests: 0, sets: missedSets };
+    const current: Workout = { ...prior, id: "current", date: "2026-06-10" };
+
+    const decisions = createProgressionDecisions(current, routine, [prior], exercises);
+    expect(decisions[0].action).toBe("reduce_load");
+    expect(decisions[0].nextWeight).toBe(bench.weight - 2.5);
   });
 });
 

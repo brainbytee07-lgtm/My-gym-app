@@ -1,10 +1,10 @@
 # FitFlow Project
 
-Last updated: 2026-06-12
+Last updated: 2026-06-29
 
 ## Product Summary
 
-FitFlow is a mobile-first gym routine planner, workout logger, exercise explorer, calorie tracker, and progress dashboard. It helps an individual gym-goer create a practical routine from their goal and available equipment, record completed work, and review trustworthy progress.
+FitFlow is a mobile-first adaptive gym coaching app. It helps an individual gym-goer create a practical routine, log what actually happened, and turn that planned-vs-actual history into a smarter next workout.
 
 Core loop:
 
@@ -12,7 +12,7 @@ Core loop:
 2. Complete a fitness profile.
 3. Choose, generate, or edit a routine.
 4. Log completed sets with actual reps and weight.
-5. Review progress, streaks, volume, personal bests, and calories.
+5. Review progression decisions and accept smarter next-workout updates.
 
 ## User Experience and Design System
 
@@ -20,7 +20,7 @@ Core loop:
 - Visual direction: off-white surfaces, violet accent, and near-black primary actions.
 - Rounded cards and compact bottom navigation.
 - Exercise-specific demonstration images from the public Free Exercise DB dataset.
-- Current accessibility upgrade focuses on readable type, 44px touch targets, keyboard focus, dialog semantics, and honest interactions.
+- Current product wedge: "log today, get a smarter next workout."
 
 ## Functional Areas
 
@@ -43,11 +43,14 @@ Core loop:
 - Rules-based routine generation using profile goal, equipment, experience, frequency, and injury flag.
 - Routine editing supports add, remove, sets, reps, target weight, rest, and exercise-image preview.
 - Active workouts record actual sets, reps, weight, completion, volume, estimated calories, and personal bests.
+- Workout completion now creates explainable progression decisions from planned-vs-actual performance.
+- Users can accept suggested load changes into the next routine version.
 
 ### Progress and Calories
 
 - Progress metrics are calculated from completed workout records.
 - Tracks workout volume, completion, streaks, personal bests, and distance to target weight.
+- Shows the latest pending adaptive coaching recommendation from workout history.
 - Calorie screen tracks food entries and estimated exercise calories for the user's local date.
 
 ## Architecture and Data Flow
@@ -56,6 +59,7 @@ Core loop:
 - Main UI and orchestration: `src/App.tsx`.
 - Shared calculations and routine generation: `src/fitness.ts`.
 - Scoped local persistence and serialized cloud-write queue: `src/storage.ts`.
+- Adaptive progression rules: `src/fitness.ts`.
 - Domain types: `src/types.ts`.
 - Seed catalog and starter data: `src/data.ts`.
 - Supabase client: `src/supabase.ts`.
@@ -67,11 +71,12 @@ The current prototype supports account-scoped local persistence and optional Sup
 ## Database and Security
 
 - Supabase schema is stored in `supabase/schema.sql`.
-- Normalized tables exist for profiles, exercises, routines, routine exercises, workouts, workout sets, measurements, and progress photos.
+- Normalized tables exist for profiles, exercises, routine versions, routine exercises, scheduled workouts, planned sets, workouts, actual sets, substitutions, progression decisions, measurements, and progress photos.
 - The UI currently uses `user_states` as the temporary cloud source of truth.
 - Row-level security restricts personal records to the authenticated owner.
 - State versioning and the `compare_and_swap_user_state` function prevent silent stale-device overwrites. Client writes are serialized and stop on conflict until the app is reloaded.
 - Full migration of the UI to normalized tables is intentionally deferred.
+- The normalized schema now reflects Fugu's requested planned-vs-actual model, but the UI still syncs through `user_states` temporarily.
 
 ## Verification and Deployment
 
@@ -102,6 +107,10 @@ Prioritize account isolation, cloud data-loss prevention, honest UI interactions
 
 Maintain `PROJECT.md` through `AGENTS.md` instructions after meaningful work. A Git hook cannot reliably understand product decisions or implementation context and would encourage low-quality automated logs.
 
+### 2026-06-29: Adopt the adaptive coaching wedge
+
+Fugu's critique was right: a broad fitness platform is weaker than a narrow adaptive loop. The product promise is now "log today, get a smarter next workout." AI coaching stays later; deterministic planned-vs-actual progression rules come first.
+
 ## Implementation Log
 
 ### 2026-06-12: Reliability and UX upgrade in progress
@@ -124,6 +133,17 @@ Maintain `PROJECT.md` through `AGENTS.md` instructions after meaningful work. A 
 - Added scoped-state, migration, queue, conflict, fitness-calculation, routine-generation, and date tests.
 - Verified 11 tests, the production build, and `git diff --check`.
 
+### 2026-06-29: Adaptive coaching wedge
+
+- Added progression-decision types and JSON sync support.
+- Added deterministic progression rules for increasing, holding, reviewing, and reducing exercise targets.
+- Added routine version increments when accepted decisions update the plan.
+- Added a workout-finish coaching card that explains next-workout recommendations.
+- Added a home-screen "Smarter next workout" prompt for pending decisions.
+- Extended Supabase schema with routine versions, scheduled workouts, planned sets, actual sets, exercise substitutions, and progression decisions.
+- Extended tests to cover adaptive load increases and repeated-miss reductions.
+- Verified 13 tests, the production build, and `git diff --check`.
+
 ### 2026-06-11: Working prototype and exercise catalog
 
 - Built the React/Vite mobile-first prototype.
@@ -133,10 +153,10 @@ Maintain `PROJECT.md` through `AGENTS.md` instructions after meaningful work. A 
 
 ## Known Constraints and Next Work
 
-- Full normalized Supabase-table integration remains deferred.
+- Full normalized Supabase-table integration remains deferred, but the schema now models planned-vs-actual training.
 - The exercise catalog has generic instructions and calorie estimates; expert content review is still needed.
 - Body-weight history and progress-photo storage are not implemented.
-- Cloud sync uses a whole-state JSON record with conflict detection rather than field-level merging.
+- Cloud sync uses a whole-state JSON record with conflict detection rather than field-level merging, including progression decisions.
 - The updated Supabase schema must be applied to the hosted project before compare-and-swap cloud writes can run.
-- Browser-level and Supabase integration tests need expansion. The final in-app browser pass was blocked by a Windows sandbox startup issue.
+- Browser-level and Supabase integration tests need expansion.
 - The production JavaScript bundle is slightly above Vite's 500 kB warning threshold; code splitting is deferred.

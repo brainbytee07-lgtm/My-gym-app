@@ -29,12 +29,29 @@ export type Routine = {
   focus: string;
   duration: number;
   color: string;
+  version?: number;
+  source?: "manual" | "generated" | "adapted";
   exercises: RoutineExercise[];
+};
+
+export type ProgressionDecision = {
+  id: string;
+  workoutId: string;
+  routineId: string;
+  exerciseId: string;
+  exerciseName: string;
+  action: "increase_load" | "hold" | "reduce_load" | "review";
+  currentWeight: number;
+  nextWeight: number;
+  reason: string;
+  status: "pending" | "accepted" | "dismissed";
+  createdAt: string;
 };
 
 export type Workout = {
   id: string;
   routineId: string;
+  routineVersion?: number;
   date: string;
   duration: number;
   volume: number;
@@ -42,6 +59,7 @@ export type Workout = {
   personalBests: number;
   calories?: number;
   sets?: WorkoutSet[];
+  progressionDecisions?: ProgressionDecision[];
 };
 
 export type WorkoutSet = {
@@ -78,6 +96,7 @@ export type FitFlowState = {
   routines: Routine[];
   workouts: Workout[];
   calories: CalorieEntry[];
+  progressionDecisions: ProgressionDecision[];
   onboarded: boolean;
 };
 

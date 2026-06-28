@@ -1,6 +1,6 @@
 # FitFlow
 
-Mobile-first gym routine planner, workout logger, and progress tracker.
+Mobile-first adaptive gym routine planner. Promise: log today, get a smarter next workout.
 
 ## What works
 
@@ -12,10 +12,12 @@ Mobile-first gym routine planner, workout logger, and progress tracker.
 - Rules-based routine generation using profile equipment and experience
 - Editable routines with sets, reps, weight, and rest
 - Active workout logging with editable and additional sets
+- Explainable adaptive progression after workout completion
+- Next-workout load suggestions based on planned vs actual performance
 - Data-derived workout volume, completion, streak, and personal-best views
 - Cardio discovery and calorie intake/burn tracking
 - Profile editing and local demo persistence
-- Supabase Google OAuth, cross-device state sync, and row-level security schema
+- Supabase Google OAuth, cross-device state sync, row-level security schema, and future normalized planned-vs-actual tables
 
 ## Run locally
 

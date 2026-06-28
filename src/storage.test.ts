@@ -19,6 +19,7 @@ const state = (name: string): FitFlowState => ({
   routines: [],
   workouts: [],
   calories: [],
+  progressionDecisions: [],
   onboarded: true,
 });
 
